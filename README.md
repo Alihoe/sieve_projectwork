@@ -131,6 +131,26 @@ Implemented in [`src/token_matching.py`](C:\repos\scientific_claim_resource_retr
 
 There is also an entity-based experiment in [`src/named_entity_ranking.py`](C:\repos\scientific_claim_resource_retrieval\src\named_entity_ranking.py). The main idea was to exploit rare named entities and linked concepts, but the stronger embedding-based methods reduced its practical impact.
 
+## Evaluation Results on Dev Set
+
+| Run | MRR@5 |
+|---|---:|
+| Standalone BM25 baseline (official starter notebook) | 0.552 |
+| `final_sievetrival.py` (`PREDICTIONS.tsv`) | 0.570 |
+| `sievetrival_val_no_reranking.py` | 0.507 |
+| Saved validation run (`final_val_predictions.tsv`) | 0.497 |
+
+Stage-wise dev results for the no-reranking validation pipeline:
+
+| Pipeline state | MRR@5 |
+|---|---:|
+| Title + quote + journal + author matching | 0.044 |
+| + MiniLM summary similarity + GTE summary similarity | 0.186 |
+| + BM25 stage | 0.282 |
+| + SPECTER + MPNet summary similarity | 0.305 |
+| + low-threshold MPNet fallback | 0.475 |
+| + final BGE fill step | 0.507 |
+
 ## What I Learned
 
 My final ranking stage did not perform as well as I wanted. The main reason was time: I explored too many settings and did not finish the large-scale LLM reranking experiments in time. I did not include the full final reranking step in the submission.
