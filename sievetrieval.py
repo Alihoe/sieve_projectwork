@@ -1,0 +1,399 @@
+import csv
+import gzip
+import pickle
+import os
+import pandas as pd
+from src.author_matching import match_authors_to_queries
+from src.bm252 import calculate_threshold, rank_all_queries
+from src.journal_matching import rank_by_journal
+from src.llm_re_ranking import rerank_queries_with_ollama
+from src.named_entity_ranking import find_queries_with_seldom_nes
+from src.quote_detection import rank_by_quotes
+from src.sentence_similarity import rank_by_semantic_similarity, get_similarity_threshold, get_distance_threshold
+from src.title_matching import rank_by_title
+from src.token_matching import find_queries_with_seldom_tokens
+from src.utils import clean_data, prepare_text_inputs, fill_dict2, save_query_results, truncate_dict
+
+PATH_COLLECTION_DATA = 'data/subtask4b_collection_data.pkl'
+
+df_collection = pd.read_pickle(PATH_COLLECTION_DATA)
+summaries_df = pd.read_csv('data/summaries.tsv', sep='\t', names=['id', 'summary'])
+summaries_dict = dict(zip(summaries_df['id'], summaries_df['summary']))
+df_collection['summary'] = df_collection['cord_uid'].map(summaries_dict)
+data_dict = df_collection.set_index('cord_uid').to_dict('index')
+with gzip.open("data/texts.pkl.gz", 'rb') as f:
+    whole_papers_dict = {k: v for k, v in pickle.load(f).items()}
+whole_papers_dict = clean_data(whole_papers_dict)
+
+all_texts_with_summary = prepare_text_inputs(df_collection, use_summary=True)
+all_texts_with_abstract = prepare_text_inputs(df_collection, use_summary=False)
+all_data_ids = df_collection['cord_uid'].tolist()
+id_to_abstract = {uid: text for uid, text in zip(all_data_ids, all_texts_with_abstract)}
+id_to_summary = {uid: text for uid, text in zip(all_data_ids, all_texts_with_summary)}
+
+whole_papers_dict.update({k: v for k, v in id_to_abstract.items() if k not in whole_papers_dict})
+
+queries_summaries_df = pd.read_csv('data/test_tweet_summaries.tsv', sep='\t', names=['id', 'summary'])
+query_summaries_dict = dict(zip(queries_summaries_df['id'], queries_summaries_df['summary']))
+
+# Load test data (assuming it follows the same format as train/dev)
+test_df = pd.read_csv('data/subtask4b_query_tweets_test.tsv', sep='\t')
+
+test_queries = test_df['tweet_text'].tolist()
+test_query_ids = test_df['post_id'].tolist()
+queries = test_queries
+query_ids = test_query_ids
+total_queries = len(queries)
+final_predictions = {qid: [] for qid in query_ids}
+unresolved_queries = set(query_ids)
+queries_dict = {pid: text for pid, text in zip(query_ids, queries)}
+
+# Predefined thresholds (these would normally be calculated from training data)
+mean_similarity = 0.6517946525885147
+std_similarity = 0.15747238809867273
+mean_distance = 0.10337032085336031
+std_distance = 0.09395258399486513
+similarity_threshold = mean_similarity
+distance_threshold = mean_distance
+n_candidates = 30
+generous_similarity_threshold = mean_similarity - std_similarity
+generous_distance_threshold = mean_distance - std_distance
+
+mean_similarity_sci = 0.8608020880380364
+std_similarity_sci = 0.05164753269378038
+mean_distance_sci = 0.01344577842134081
+std_distance_sci = 0.012691256058858872
+similarity_threshold_sci = mean_similarity_sci + std_similarity_sci
+distance_threshold_sci = mean_distance_sci + std_distance_sci
+
+mean_similarity_mpnet=0.6848235173594495
+std_similarity_mpnet=0.1605105865157184
+mean_distance_mpnet=0.09782780249794855
+std_distance_mpnet=0.1605105865157184
+similarity_threshold_mpnet = mean_similarity_mpnet
+distance_threshold_mpnet = mean_distance_mpnet
+generous_similarity_threshold_mpnet = mean_similarity_mpnet - std_similarity_mpnet
+generous_distance_threshold_mpnet = mean_distance_mpnet - std_distance_mpnet
+
+mean_similarity_spc = 0.8423419033753903
+std_similarity_spc = 0.07132700116476645
+mean_distance_spc = 0.041100625714210616
+std_distance_spc = 0.03623312174309394
+similarity_threshold_spc = mean_similarity_spc
+distance_threshold_spc = mean_distance_spc
+
+bm25_abstracts_mean = 61.071572593218015
+bm25_abstracts_std = 31.905156653723697
+bm25_abstracts_threshold = bm25_abstracts_mean
+bm25_whole_papers_mean = 66.90418735869673
+bm25_whole_papers_std = 43.744064315317125
+bm25_whole_papers_threshold = bm25_whole_papers_mean + bm25_abstracts_threshold
+
+print(f"Starting pipeline with {len(queries)} queries")
+
+final_predictions = {}
+
+print("\n Component: Title Detection")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/title_predictions.pkl') and os.path.exists('data/test_component_predictions/title_not_ranked.pkl'):
+    with open('data/test_component_predictions/title_predictions.pkl', 'rb') as f:
+        predictions_td = pickle.load(f)
+    with open('data/test_component_predictions/title_not_ranked.pkl', 'rb') as f:
+        not_ranked_td = pickle.load(f)
+else:
+    predictions_td, not_ranked_td = rank_by_title(current_queries_dict, data_dict)
+    with open('data/test_component_predictions/title_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_td, f)
+    with open('data/test_component_predictions/title_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_td, f)
+final_predictions= final_predictions | predictions_td
+unresolved_queries &= set(not_ranked_td)
+resolved_now = set(current_queries) - set(not_ranked_td)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Quote Detection")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/quote_predictions.pkl') and os.path.exists('data/test_component_predictions/quote_not_ranked.pkl'):
+    with open('data/test_component_predictions/quote_predictions.pkl', 'rb') as f:
+        predictions_qd = pickle.load(f)
+    with open('data/test_component_predictions/quote_not_ranked.pkl', 'rb') as f:
+        not_ranked_qd = pickle.load(f)
+else:
+    predictions_qd, not_ranked_qd = rank_by_quotes(current_queries_dict, all_data_ids, data_dict, texts_file="data/texts.pkl.gz")
+    predictions_qd = rerank_queries_with_ollama(predictions_qd, queries_dict, data_dict, max_candidates=n_candidates)
+    with open('data/test_component_predictions/quote_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_qd, f)
+    with open('data/test_component_predictions/quote_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_qd, f)
+final_predictions= final_predictions | predictions_qd
+unresolved_queries &= set(not_ranked_qd)
+resolved_now = set(current_queries) - set(not_ranked_qd)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Summary Similarity")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/summary_predictions.pkl') and os.path.exists('data/test_component_predictions/summary_not_ranked.pkl'):
+    with open('data/test_component_predictions/summary_predictions.pkl', 'rb') as f:
+        predictions_sus = pickle.load(f)
+    with open('data/test_component_predictions/summary_not_ranked.pkl', 'rb') as f:
+        not_ranked_sus = pickle.load(f)
+else:
+    predictions_sus, not_ranked_sus = rank_by_semantic_similarity(current_queries_dict, all_texts_with_summary, all_data_ids, similarity_threshold=similarity_threshold, distance_threshold=distance_threshold, top_n=n_candidates)
+    with open('data/test_component_predictions/summary_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_sus, f)
+    with open('data/test_component_predictions/summary_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_sus, f)
+final_predictions = final_predictions | predictions_sus
+unresolved_queries &= set(not_ranked_sus)
+resolved_now = set(current_queries) - set(not_ranked_sus)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: BM25 on Abstracts")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/bm25_abstracts_predictions.pkl') and os.path.exists('data/test_component_predictions/bm25_abstracts_not_ranked.pkl'):
+    with open('data/test_component_predictions/bm25_abstracts_predictions.pkl', 'rb') as f:
+        predictions_bm25 = pickle.load(f)
+    with open('data/test_component_predictions/bm25_abstracts_not_ranked.pkl', 'rb') as f:
+        not_ranked_bm25 = pickle.load(f)
+else:
+    predictions_bm25, not_ranked_bm25 = rank_all_queries(current_queries_dict, id_to_abstract, threshold=bm25_abstracts_threshold, top_k=n_candidates)
+    with open('data/test_component_predictions/bm25_abstracts_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_bm25, f)
+    with open('data/test_component_predictions/bm25_abstracts_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_bm25, f)
+overlap = set(predictions_sus.keys()) & set(predictions_bm25.keys())
+final_predictions = final_predictions | predictions_bm25
+unresolved_queries &= set(not_ranked_bm25)
+resolved_now = set(current_queries) - set(not_ranked_bm25)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Scientific Similarity SPECTER")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/specter_predictions.pkl') and os.path.exists('data/test_component_predictions/specter_not_ranked.pkl'):
+    with open('data/test_component_predictions/specter_predictions.pkl', 'rb') as f:
+        predictions_specs = pickle.load(f)
+    with open('data/test_component_predictions/specter_not_ranked.pkl', 'rb') as f:
+        not_ranked_specs = pickle.load(f)
+else:
+    predictions_specs, not_ranked_specs = rank_by_semantic_similarity(current_queries_dict, all_texts_with_summary, all_data_ids, similarity_threshold=similarity_threshold_spc, distance_threshold=distance_threshold_spc, model="specter", top_n=n_candidates)
+    with open('data/test_component_predictions/specter_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_specs, f)
+    with open('data/test_component_predictions/specter_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_specs, f)
+final_predictions= final_predictions | predictions_specs
+unresolved_queries &= set(not_ranked_specs)
+resolved_now = set(current_queries) - set(not_ranked_specs)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Summary Similarity MPNET")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/mpnet_predictions.pkl') and os.path.exists('data/test_component_predictions/mpnet_not_ranked.pkl'):
+    with open('data/test_component_predictions/mpnet_predictions.pkl', 'rb') as f:
+        predictions_mpnet = pickle.load(f)
+    with open('data/test_component_predictions/mpnet_not_ranked.pkl', 'rb') as f:
+        not_ranked_mpnet = pickle.load(f)
+else:
+    predictions_mpnet, not_ranked_mpnet = rank_by_semantic_similarity(current_queries_dict, all_texts_with_summary, all_data_ids, similarity_threshold=similarity_threshold_mpnet, distance_threshold=distance_threshold_mpnet, model="mpnet", top_n=n_candidates)
+    with open('data/test_component_predictions/mpnet_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_mpnet, f)
+    with open('data/test_component_predictions/mpnet_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_mpnet, f)
+final_predictions = final_predictions | predictions_mpnet
+unresolved_queries &= set(not_ranked_mpnet)
+resolved_now = set(current_queries) - set(not_ranked_mpnet)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+# print("\n Component: Scientific Similarity")
+# current_queries = list(unresolved_queries)
+# current_queries_dict = {k: queries_dict[k] for k in current_queries}
+# if os.path.exists('data/test_component_predictions/scibert_predictions.pkl') and os.path.exists('data/test_component_predictions/scibert_not_ranked.pkl'):
+#     with open('data/test_component_predictions/scibert_predictions.pkl', 'rb') as f:
+#         predictions_scis = pickle.load(f)
+#     with open('data/test_component_predictions/scibert_not_ranked.pkl', 'rb') as f:
+#         not_ranked_scis = pickle.load(f)
+# else:
+#     predictions_scis, not_ranked_scis = rank_by_semantic_similarity(current_queries_dict, all_texts_with_summary, all_data_ids, similarity_threshold=similarity_threshold_sci, distance_threshold=distance_threshold_sci, model="scibert", top_n=n_candidates)
+#     with open('data/test_component_predictions/scibert_predictions.pkl', 'wb') as f:
+#         pickle.dump(predictions_scis, f)
+#     with open('data/test_component_predictions/scibert_not_ranked.pkl', 'wb') as f:
+#         pickle.dump(not_ranked_scis, f)
+# final_predictions= final_predictions | predictions_scis
+# unresolved_queries &= set(not_ranked_scis)
+# resolved_now = set(current_queries) - set(not_ranked_scis)
+# print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+# print("\n Component: BM25 on Whole Papers")
+# current_queries = list(unresolved_queries)
+# current_queries_dict = {id: queries_dict[id] for id in current_queries if id in queries_dict}
+# if os.path.exists('data/test_component_predictions/bm25_whole_predictions.pkl') and os.path.exists('data/test_component_predictions/bm25_whole_not_ranked.pkl'):
+#     with open('data/test_component_predictions/bm25_whole_predictions.pkl', 'rb') as f:
+#         predictions_bm25wp = pickle.load(f)
+#     with open('data/test_component_predictions/bm25_whole_not_ranked.pkl', 'rb') as f:
+#         not_ranked_bm25wp = pickle.load(f)
+# else:
+#     predictions_bm25wp, not_ranked_bm25wp = rank_all_queries(current_queries_dict, whole_papers_dict, threshold=bm25_whole_papers_threshold, top_k=n_candidates)
+#     with open('data/test_component_predictions/bm25_whole_predictions.pkl', 'wb') as f:
+#         pickle.dump(predictions_bm25wp, f)
+#     with open('data/test_component_predictions/bm25_whole_not_ranked.pkl', 'wb') as f:
+#         pickle.dump(not_ranked_bm25wp, f)
+# unresolved_queries &= set(not_ranked_bm25wp)
+# resolved_now = set(current_queries) - set(not_ranked_bm25wp)
+# for qid in resolved_now:
+#     final_predictions[qid] = predictions_bm25wp.get(qid, [])
+# print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+# print("\n Component: Unique Named Entity Linking")
+# current_queries = list(unresolved_queries)
+# current_queries_dict = {k: queries_dict[k] for k in current_queries}
+# if os.path.exists('data/test_component_predictions/ne_linking_predictions.pkl') and os.path.exists('data/test_component_predictions/ne_linking_not_ranked.pkl'):
+#     with open('data/test_component_predictions/ne_linking_predictions.pkl', 'rb') as f:
+#         predictions_untr = pickle.load(f)
+#     with open('data/test_component_predictions/ne_linking_not_ranked.pkl', 'rb') as f:
+#         not_ranked_untr = pickle.load(f)
+# else:
+#     predictions_untr, not_ranked_untr = find_queries_with_seldom_nes(current_queries_dict, id_to_abstract)
+#     with open('data/test_component_predictions/ne_linking_predictions.pkl', 'wb') as f:
+#         pickle.dump(predictions_untr, f)
+#     with open('data/test_component_predictions/ne_linking_not_ranked.pkl', 'wb') as f:
+#         pickle.dump(not_ranked_untr, f)
+# final_predictions = final_predictions | predictions_untr
+# unresolved_queries &= set(not_ranked_untr)
+# resolved_now = set(current_queries) - set(not_ranked_untr)
+# print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Unique Token Linking")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/token_linking_predictions.pkl') and os.path.exists('data/test_component_predictions/token_linking_not_ranked.pkl'):
+    with open('data/test_component_predictions/token_linking_predictions.pkl', 'rb') as f:
+        predictions_untr = pickle.load(f)
+    with open('data/test_component_predictions/token_linking_not_ranked.pkl', 'rb') as f:
+        not_ranked_untr = pickle.load(f)
+else:
+    predictions_untr, not_ranked_untr = find_queries_with_seldom_tokens(current_queries_dict, id_to_abstract)
+    with open('data/test_component_predictions/token_linking_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_untr, f)
+    with open('data/test_component_predictions/token_linking_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_untr, f)
+final_predictions = final_predictions | predictions_untr
+unresolved_queries &= set(not_ranked_untr)
+resolved_now = set(current_queries) - set(not_ranked_untr)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Journal Detection")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/journal_predictions.pkl') and os.path.exists('data/test_component_predictions/journal_not_ranked.pkl'):
+    with open('data/test_component_predictions/journal_predictions.pkl', 'rb') as f:
+        predictions_jd = pickle.load(f)
+    with open('data/test_component_predictions/journal_not_ranked.pkl', 'rb') as f:
+        not_ranked_jd = pickle.load(f)
+else:
+    predictions_jd, not_ranked_jd = rank_by_journal(current_queries_dict, data_dict)
+    predictions_jd = rerank_queries_with_ollama(predictions_jd, queries_dict, data_dict, max_candidates=n_candidates)
+    with open('data/test_component_predictions/journal_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_jd, f)
+    with open('data/test_component_predictions/journal_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_jd, f)
+final_predictions = final_predictions | predictions_jd
+unresolved_queries &= set(not_ranked_jd)
+resolved_now = set(current_queries) - set(not_ranked_jd)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Author Detection")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/author_predictions.pkl') and os.path.exists('data/test_component_predictions/author_not_ranked.pkl'):
+    with open('data/test_component_predictions/author_predictions.pkl', 'rb') as f:
+        predictions_ad = pickle.load(f)
+    with open('data/test_component_predictions/author_not_ranked.pkl', 'rb') as f:
+        not_ranked_ad = pickle.load(f)
+else:
+    predictions_ad, not_ranked_ad = match_authors_to_queries(data_dict, current_queries_dict)
+    predictions_ad = rerank_queries_with_ollama(predictions_ad, queries_dict, data_dict, max_candidates=n_candidates)
+    with open('data/test_component_predictions/author_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_ad, f)
+    with open('data/test_component_predictions/author_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_ad, f)
+final_predictions.update(predictions_ad)
+unresolved_queries &= set(not_ranked_ad)
+resolved_now = set(current_queries) - set(not_ranked_ad)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+print("\n Component: Generous Summary Similarity MPNET")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/mpnet_predictions.pkl') and os.path.exists('data/test_component_predictions/mpnet_not_ranked.pkl'):
+    with open('data/test_component_predictions/mpnet_predictions.pkl', 'rb') as f:
+        predictions_mpnet_gt = pickle.load(f)
+    with open('data/test_component_predictions/mpnet_not_ranked.pkl', 'rb') as f:
+        not_ranked_mpnet_gt = pickle.load(f)
+else:
+    predictions_mpnet_gt, not_ranked_mpnet_gt = rank_by_semantic_similarity(current_queries_dict, all_texts_with_summary, all_data_ids, similarity_threshold=generous_similarity_threshold_mpnet, distance_threshold=generous_distance_threshold_mpnet, model="mpnet", top_n=n_candidates)
+    with open('data/test_component_predictions/mpnet_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_mpnet_gt, f)
+    with open('data/test_component_predictions/mpnet_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_mpnet_gt, f)
+final_predictions = final_predictions | predictions_mpnet_gt
+unresolved_queries &= set(not_ranked_mpnet_gt)
+resolved_now = set(current_queries) - set(not_ranked_mpnet_gt)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+
+print("\n Component: Fill with Summary Similarity MPNET No Thresholds")
+if os.path.exists('data/test_component_predictions/mpnet_ntf_predictions.pkl'):
+    with open('data/test_component_predictions/mpnet_ntf_predictions.pkl', 'rb') as f:
+        all_predictions_mpnet_ntf = pickle.load(f)
+else:
+    all_predictions_mpnet_ntf, _ = rank_by_semantic_similarity(queries_dict, all_texts_with_summary,
+                                                                        all_data_ids, similarity_threshold=0,
+                                                                        distance_threshold=0, model="mpnet",
+                                                                        top_n=n_candidates)
+    with open('data/test_component_predictions/mpnet_ntf_predictions.pkl', 'wb') as f:
+        pickle.dump(all_predictions_mpnet_ntf, f)
+
+final_predictions = fill_dict2(all_predictions_mpnet_ntf, final_predictions, n_candidates)
+
+print("\n Component: Final Summary Similarity MPNET No Thresholds")
+current_queries = list(unresolved_queries)
+current_queries_dict = {k: queries_dict[k] for k in current_queries}
+if os.path.exists('data/test_component_predictions/mpnet_nt_predictions.pkl') and os.path.exists('data/test_component_predictions/mpnet_nt_not_ranked.pkl'):
+    with open('data/test_component_predictions/mpnet_nt_predictions.pkl', 'rb') as f:
+        predictions_mpnet_nt = pickle.load(f)
+    with open('data/test_component_predictions/mpnet_nt_not_ranked.pkl', 'rb') as f:
+        not_ranked_mpnet_nt = pickle.load(f)
+else:
+    predictions_mpnet_nt, not_ranked_mpnet_nt = rank_by_semantic_similarity(current_queries_dict, all_texts_with_summary, all_data_ids, similarity_threshold=0, distance_threshold=1, model="mpnet", top_n=n_candidates)
+    predictions_mpnet_nt = rerank_queries_with_ollama(predictions_mpnet_nt, queries_dict, data_dict, max_candidates=n_candidates)
+    with open('data/test_component_predictions/mpnet_nt_predictions.pkl', 'wb') as f:
+        pickle.dump(predictions_mpnet_nt, f)
+    with open('data/test_component_predictions/mpnet_nt_not_ranked.pkl', 'wb') as f:
+        pickle.dump(not_ranked_mpnet_nt, f)
+final_predictions = final_predictions | predictions_mpnet_nt
+unresolved_queries &= set(not_ranked_mpnet_nt)
+resolved_now = set(current_queries) - set(not_ranked_mpnet_nt)
+print(f"Resolved queries: {total_queries - len(unresolved_queries)}/{total_queries}")
+
+
+final_predictions = truncate_dict(final_predictions)
+
+
+with open('final_test_predictions.tsv', 'w', newline='') as csvfile:
+    writer = csv.writer(csvfile)
+    for key, value in final_predictions.items():
+        writer.writerow([key, value])
+
+df = pd.DataFrame(list(final_predictions.items()))
+df.to_csv('test_predictions.tsv', index=False)
+
+print("\nFinal Results:")
+print(f"Total queries processed: {total_queries}")
+print(f"Unresolved queries: {len(unresolved_queries)}")
+
+save_query_results(unresolved_queries, queries_dict, None, data_dict, output_file="query_results.txt")
