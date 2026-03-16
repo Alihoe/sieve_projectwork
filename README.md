@@ -8,8 +8,6 @@ In this task, the goal is to retrieve the scientific paper referenced by a socia
 
 Given an implicit reference to a scientific paper, that is, a tweet mentioning a research publication without a URL, retrieve the corresponding paper from a pool of candidate papers.
 
-The official task description is also included in [the shared CLEF materials](C:\repos\scientific_claim_resource_retrieval\clef2025-checkthat-lab-main\task4\subtask_4b\README.md).
-
 ## System Overview
 
 My retrieval system, **Sieve**, is built as a pipeline of retrieval components ranging from low computational cost to higher computational cost. Queries that cannot be predicted confidently by an earlier stage are passed to the next component. In addition, some queries are routed through data-specific components when they contain attributes such as direct quotes, journal mentions, or author names.
